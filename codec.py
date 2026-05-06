@@ -46,6 +46,47 @@ class Codec:
         return codes
 
     # ------------------------------------------------------------------
+    # Encode continuous: audio file → continuous embeddings
+    # ------------------------------------------------------------------
+    def encode_continuous(self, audio_path: str) -> torch.Tensor:
+        """Load an audio file and return post-quantization continuous embeddings.
+
+        Args:
+            audio_path: Path to an input audio file (MP3, WAV, etc.).
+
+        Returns:
+            Tensor of shape ``[1, 128, T]`` — the quantized continuous
+            embeddings that the decoder consumes.
+        """
+        wav, sr = torchaudio.load(audio_path)
+        wav = convert_audio(wav, sr, self.sample_rate, self.channels)
+        wav = wav.unsqueeze(0)  # [1, C, T]
+
+        with torch.no_grad():
+            emb = self.model.encoder(wav)
+            codes = self.model.quantizer.encode(
+                emb, self.model.frame_rate, self.model.bandwidth
+            )
+            emb_q = self.model.quantizer.decode(codes)
+        return emb_q
+
+    # ------------------------------------------------------------------
+    # Decode continuous: continuous embeddings → audio file
+    # ------------------------------------------------------------------
+    def decode_continuous(self, emb: torch.Tensor, output_path: str) -> None:
+        """Decode continuous embeddings back to audio and save to disk.
+
+        Args:
+            emb: Tensor of shape ``[1, 128, T]`` (as returned by
+                :meth:`encode_continuous`).
+            output_path: Destination file path.
+        """
+        with torch.no_grad():
+            audio = self.model.decoder(emb)
+        audio = audio.squeeze(0)
+        torchaudio.save(output_path, audio.cpu(), self.sample_rate)
+
+    # ------------------------------------------------------------------
     # Decode: discrete tokens → audio file
     # ------------------------------------------------------------------
     def decode(self, codes: torch.Tensor, output_path: str) -> None:
