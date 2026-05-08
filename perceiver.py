@@ -1,20 +1,53 @@
 """
-Residual elastic perceiver for rectified flow on EnCodec latent tokens.
+Text-conditioned residual elastic perceiver for rectified flow.
 
 Architecture:
-  1. Time t ∈ [0,1] → MLP → prepended as extra token
-  2. Cross-attn DOWN: elastic latent bank attends to input tokens
-  3. Self-attention in latent space
-  4. Cross-attn UP (ELIT-style residual): input attends to latents
-  5. Strip the time token, project back to input dim → velocity prediction
+  1. Time t ∈ [0,1] → MLP → 1 conditioning token
+  2. Text chars → char_emb + segment_emb → text conditioning tokens
+  3. Context audio → proj + segment_emb → context conditioning tokens
+  4. Noisy target → proj + segment_emb → target query tokens
+  5. Cross-attn DOWN: latents attend to ALL tokens (time+text+ctx+target)
+  6. Self-attention × N in latent space
+  7. Cross-attn UP (ELIT residual): only TARGET tokens attend to latents
+  8. Output MLP → velocity for target tokens only
 
-All attention layers use RoPE (via torchtune) for positional encoding.
+Segment embedding IDs:
+  0 = prior text      1 = upcoming text
+  2 = context audio   3 = target audio
+
+Character vocabulary (37 tokens):
+  a-z = 0..25,  0-9 = 26..35,  <pad> = 36
+
+All attention uses RoPE (via torchtune) for positional encoding.
 """
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torchtune.modules import RotaryPositionalEmbeddings
+
+# ── Character vocabulary ────────────────────────────────────────────
+CHAR_VOCAB_SIZE = 37  # a-z (26) + 0-9 (10) + pad (1)
+CHAR_PAD_ID = 36
+
+SEG_PRIOR_TEXT = 0
+SEG_UPCOMING_TEXT = 1
+SEG_CTX_AUDIO = 2
+SEG_TGT_AUDIO = 3
+
+
+def text_to_ids(text: str) -> list[int]:
+    """Strip non-alphanumeric, lowercase, convert to char IDs.
+
+    a-z → 0..25, 0-9 → 26..35.  Everything else is dropped.
+    """
+    ids: list[int] = []
+    for ch in text.lower():
+        if "a" <= ch <= "z":
+            ids.append(ord(ch) - ord("a"))
+        elif "0" <= ch <= "9":
+            ids.append(26 + ord(ch) - ord("0"))
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +82,6 @@ class DenseMLP(nn.Module):
 class MLP(nn.Module):
     """
     Linear(in→hidden) → [DenseMLP(2 layers) + skip] → Linear(hidden→out).
-
-    The skip connection is:  x' = x + DenseMLP(x)  (in the hidden space).
     """
 
     def __init__(
@@ -71,7 +102,7 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.up(x)
         for block in self.blocks:
-            x = x + block(x)  # skip connection
+            x = x + block(x)
         x = self.down(x)
         return x
 
@@ -81,12 +112,7 @@ class MLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RoPECrossAttention(nn.Module):
-    """
-    Pre-norm cross-attention with RoPE on Q and K.
-
-    ``query`` attends to ``kv``.  RoPE is applied to Q (using query
-    positions) and K (using kv positions).
-    """
+    """Pre-norm cross-attention with RoPE on Q and K."""
 
     def __init__(self, dim: int, num_heads: int = 8, max_seq_len: int = 2048):
         super().__init__()
@@ -113,30 +139,24 @@ class RoPECrossAttention(nn.Module):
         q_n = self.norm_q(q)
         kv_n = self.norm_kv(kv)
 
-        # Project to [B, S, num_heads, head_dim]
         Q = self.w_q(q_n).view(B, S_q, self.num_heads, self.head_dim)
         K = self.w_k(kv_n).view(B, S_kv, self.num_heads, self.head_dim)
         V = self.w_v(kv_n).view(B, S_kv, self.num_heads, self.head_dim)
 
-        # Apply RoPE to Q and K
         Q = self.rope(Q)
         K = self.rope(K)
 
-        # Transpose for attention: [B, num_heads, S, head_dim]
         Q = Q.transpose(1, 2)
         K = K.transpose(1, 2)
         V = V.transpose(1, 2)
 
-        # Scaled dot-product attention
-        out = F.scaled_dot_product_attention(Q, K, V)  # [B, nh, S_q, hd]
-
-        # Merge heads and project
+        out = F.scaled_dot_product_attention(Q, K, V)
         out = out.transpose(1, 2).contiguous().view(B, S_q, -1)
         return self.w_o(out)
 
 
 class RoPESelfAttentionBlock(nn.Module):
-    """Pre-norm self-attention + FFN with residuals. Uses RoPE."""
+    """Pre-norm self-attention + FFN with residuals.  Uses RoPE."""
 
     def __init__(self, dim: int, num_heads: int = 8, max_seq_len: int = 2048):
         super().__init__()
@@ -164,7 +184,6 @@ class RoPESelfAttentionBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, S, _ = x.shape
 
-        # --- Self-attention with RoPE ---
         normed = self.norm1(x)
         Q = self.w_q(normed).view(B, S, self.num_heads, self.head_dim)
         K = self.w_k(normed).view(B, S, self.num_heads, self.head_dim)
@@ -182,51 +201,42 @@ class RoPESelfAttentionBlock(nn.Module):
         attn_out = self.w_o(attn_out)
 
         x = x + attn_out
-
-        # --- FFN with residual ---
         x = x + self.ff(self.norm2(x))
         return x
 
 
 # ---------------------------------------------------------------------------
-# Rectified-Flow Perceiver
+# Rectified-Flow Perceiver (text-conditioned, target-only UP)
 # ---------------------------------------------------------------------------
 
 class RectifiedFlowPerceiver(nn.Module):
     """
-    Elastic perceiver that predicts the velocity field for rectified flow.
+    Text-conditioned elastic perceiver that predicts the velocity field
+    for rectified flow on EnCodec latent tokens.
 
     Forward signature::
 
-        v = model(z_t, t)
-        # z_t : (B, seq_len, input_dim)  — noisy latent tokens
-        # t   : (B,)                     — diffusion time in [0, 1]
-        # v   : (B, seq_len, input_dim)  — predicted velocity
+        v = model(z_t, t, context_audio, text_ids, text_segments)
 
-    Architecture
-    ------------
-    1. **Time conditioning**: ``t`` is projected via an MLP to a single
-       ``dim``-dimensional token and prepended to the input sequence.
-    2. **Input projection**: Linear(input_dim → dim).
-    3. **Cross-attn DOWN**: learnable latent bank (``max_latents × dim``)
-       attends to the (time + input) tokens — elastic compute by slicing.
-    4. **Self-attention** layers in latent space.
-    5. **Cross-attn UP** (ELIT-style residual):
-       ``cross_out = cross_attn(q=x, kv=latents)``
-       ``z = LayerNorm(cross_out) + x``
-       ``fused = MLP(z) + z``
-    6. Strip the first (time) token → last ``seq_len`` vectors.
-    7. Output MLP back to ``input_dim`` → velocity prediction.
+    Parameters
+    ----------
+    z_t            : (B, target_len, input_dim)  — noisy target audio
+    t              : (B,)                        — flow time in [0, 1]
+    context_audio  : (B, ctx_len, input_dim)     — clean context audio
+    text_ids       : (B, text_len)               — character indices
+    text_segments  : (B, text_len)               — 0=prior, 1=upcoming
 
-    All attention uses RoPE for positional encoding.
+    Returns
+    -------
+    v : (B, target_len, input_dim) — predicted velocity (target only)
     """
 
     def __init__(
         self,
         input_dim: int,
-        dim: int = 512,
+        dim: int = 256,
         num_heads: int = 8,
-        num_latent_layers: int = 6,
+        num_latent_layers: int = 12,
         max_latents: int = 256,
         max_seq_len: int = 2048,
     ):
@@ -234,98 +244,107 @@ class RectifiedFlowPerceiver(nn.Module):
         self.input_dim = input_dim
         self.dim = dim
         self.max_latents = max_latents
-        self.head_dim = dim // num_heads
 
-        # --- Time conditioning ---
+        # ── Time conditioning ───────────────────────────────────────
         self.time_mlp = MLP(
-            input_size=1,
-            output_size=dim,
-            hidden_dim=dim,
-            num_hidden_blocks=1,
+            input_size=1, output_size=dim, hidden_dim=dim, num_hidden_blocks=1,
         )
 
-        # --- Input projection ---
+        # ── Text embeddings ─────────────────────────────────────────
+        self.char_emb = nn.Embedding(CHAR_VOCAB_SIZE, dim, padding_idx=CHAR_PAD_ID)
+
+        # ── Segment embeddings (4-way) ──────────────────────────────
+        # 0=prior_text, 1=upcoming_text, 2=ctx_audio, 3=tgt_audio
+        self.segment_emb = nn.Embedding(4, dim)
+
+        # ── Audio projection ────────────────────────────────────────
         self.input_proj = nn.Linear(input_dim, dim)
 
-        # --- Learnable latent bank (sliced for elastic compute) ---
+        # ── Learnable latent bank ───────────────────────────────────
         self.latents = nn.Parameter(torch.randn(max_latents, dim) * 0.02)
 
-        # --- Cross-attn DOWN: latents attend to input tokens ---
+        # ── Cross-attn DOWN: latents attend to full input ───────────
         self.cross_attn_down = RoPECrossAttention(
-            dim=dim, num_heads=num_heads, max_seq_len=max_seq_len
+            dim=dim, num_heads=num_heads, max_seq_len=max_seq_len,
         )
 
-        # --- Self-attention in latent space ---
+        # ── Self-attention in latent space ──────────────────────────
         self.latent_layers = nn.ModuleList([
             RoPESelfAttentionBlock(
-                dim=dim, num_heads=num_heads, max_seq_len=max_seq_len
+                dim=dim, num_heads=num_heads, max_seq_len=max_seq_len,
             )
             for _ in range(num_latent_layers)
         ])
 
-        # --- Cross-attn UP (ELIT-style) ---
+        # ── Cross-attn UP (target-only, ELIT-style residual) ───────
         self.cross_attn_up = RoPECrossAttention(
-            dim=dim, num_heads=num_heads, max_seq_len=max_seq_len
+            dim=dim, num_heads=num_heads, max_seq_len=max_seq_len,
         )
         self.post_cross_norm = nn.LayerNorm(dim)
         self.post_cross_mlp = MLP(
-            input_size=dim,
-            output_size=dim,
-            hidden_dim=dim,
+            input_size=dim, output_size=dim, hidden_dim=dim,
             num_hidden_blocks=1,
         )
 
-        # --- Output projection: dim → input_dim (velocity) ---
+        # ── Output projection → velocity ───────────────────────────
         self.output_mlp = MLP(
-            input_size=dim,
-            output_size=input_dim,
-            hidden_dim=dim,
+            input_size=dim, output_size=input_dim, hidden_dim=dim,
             num_hidden_blocks=1,
         )
 
     def forward(
         self,
-        z_t: torch.Tensor,        # (B, seq_len, input_dim) — noisy latents
-        t: torch.Tensor,           # (B,) — time in [0, 1]
+        z_t: torch.Tensor,            # (B, target_len, input_dim)
+        t: torch.Tensor,               # (B,)
+        context_audio: torch.Tensor,   # (B, ctx_len, input_dim)
+        text_ids: torch.Tensor,        # (B, text_len)
+        text_segments: torch.Tensor,   # (B, text_len)  — 0 or 1
         n_latents: int | None = None,
     ) -> torch.Tensor:
-        """
-        Returns
-        -------
-        v : (B, seq_len, input_dim) — predicted velocity for rectified flow.
-        """
-        B, seq_len, _ = z_t.shape
+        B = z_t.shape[0]
 
-        # (1) Time token: (B,) → (B, 1, 1) → MLP → (B, 1, dim)
+        # ① Time token
         t_tok = self.time_mlp(t.view(B, 1, 1))  # (B, 1, dim)
 
-        # (2) Project input tokens
-        x = self.input_proj(z_t)  # (B, seq_len, dim)
+        # ② Text tokens: char_emb + segment_emb
+        text_tok = (
+            self.char_emb(text_ids)
+            + self.segment_emb(text_segments)
+        )  # (B, text_len, dim)
 
-        # Prepend time token → (B, 1 + seq_len, dim)
-        x = torch.cat([t_tok, x], dim=1)
+        # ③ Context audio tokens: proj + segment_emb[2]
+        ctx_tok = (
+            self.input_proj(context_audio)
+            + self.segment_emb.weight[SEG_CTX_AUDIO]
+        )  # (B, ctx_len, dim)
 
-        # (3) Elastic latents
+        # ④ Target audio tokens: proj + segment_emb[3]
+        tgt_tok = (
+            self.input_proj(z_t)
+            + self.segment_emb.weight[SEG_TGT_AUDIO]
+        )  # (B, target_len, dim)
+
+        # ⑤ Full input for cross-attn DOWN
+        full_input = torch.cat([t_tok, text_tok, ctx_tok, tgt_tok], dim=1)
+
+        # Elastic latents
         if n_latents is None:
             n_latents = self.max_latents
         n_latents = max(1, min(n_latents, self.max_latents))
         latents = self.latents[:n_latents].unsqueeze(0).expand(B, -1, -1)
 
         # Cross-attn DOWN + residual
-        latents = self.cross_attn_down(latents, x) + latents
+        latents = self.cross_attn_down(latents, full_input) + latents
 
-        # (4) Self-attention in latent space
+        # ⑥ Self-attention in latent space
         for layer in self.latent_layers:
             latents = layer(latents)
 
-        # (5) Cross-attn UP — ELIT-style residual
-        cross_out = self.cross_attn_up(x, latents)
-        z = self.post_cross_norm(cross_out) + x
-        fused = self.post_cross_mlp(z) + z  # (B, 1 + seq_len, dim)
+        # ⑦ Cross-attn UP — ONLY target tokens as queries
+        cross_out = self.cross_attn_up(tgt_tok, latents)
+        z = self.post_cross_norm(cross_out) + tgt_tok   # residual to noisy target
+        fused = self.post_cross_mlp(z) + z               # second residual
 
-        # (6) Strip time token → keep last seq_len vectors
-        fused = fused[:, 1:, :]  # (B, seq_len, dim)
-
-        # (7) Output projection → velocity
-        v = self.output_mlp(fused)  # (B, seq_len, input_dim)
+        # ⑧ Output projection → velocity (target only)
+        v = self.output_mlp(fused)  # (B, target_len, input_dim)
         return v
