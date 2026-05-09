@@ -1,19 +1,18 @@
 """
-Text-conditioned residual elastic perceiver for rectified flow.
+Text + loudness conditioned perceiver for rectified flow on EnCodec latents.
 
 Architecture:
   1. Time t ∈ [0,1] → MLP → 1 conditioning token
-  2. Text chars → char_emb + segment_emb → text conditioning tokens
-  3. Context audio → proj + segment_emb → context conditioning tokens
-  4. Noisy target → proj + segment_emb → target query tokens
-  5. Cross-attn DOWN: latents attend to ALL tokens (time+text+ctx+target)
-  6. Self-attention × N in latent space
-  7. Cross-attn UP (ELIT residual): only TARGET tokens attend to latents
-  8. Output MLP → velocity for target tokens only
+  2. Transcription (128 chars) → char_emb + learned char_type_emb → 128 tokens
+  3. Loudness (50 scalars) → per-value Linear→LN→MLP + learned loudness_type_emb → 50 tokens
+  4. Noisy signal z_t [T_target, 128] → MLP(128→dim) + learned signal_type_emb → T_target tokens
+  5. Concatenate all → 3 layers RoPE self-attention (context processing)
+  6. Cross-attn DOWN: 256 learned latents attend to context
+  7. 8 layers RoPE self-attention in latent space
+  8. Cross-attn UP: learned decoder array [T_target, dim] attends to latents
+  9. Output MLP → velocity [B, T_target, 128]
 
-Segment embedding IDs:
-  0 = prior text      1 = upcoming text
-  2 = context audio   3 = target audio
+Trained with rectified flow objective against EnCodec continuous embeddings.
 
 Character vocabulary (37 tokens):
   a-z = 0..25,  0-9 = 26..35,  <pad> = 36
@@ -29,11 +28,6 @@ from torchtune.modules import RotaryPositionalEmbeddings
 # ── Character vocabulary ────────────────────────────────────────────
 CHAR_VOCAB_SIZE = 37  # a-z (26) + 0-9 (10) + pad (1)
 CHAR_PAD_ID = 36
-
-SEG_PRIOR_TEXT = 0
-SEG_UPCOMING_TEXT = 1
-SEG_CTX_AUDIO = 2
-SEG_TGT_AUDIO = 3
 
 
 def text_to_ids(text: str) -> list[int]:
@@ -206,64 +200,84 @@ class RoPESelfAttentionBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Rectified-Flow Perceiver (text-conditioned, target-only UP)
+# Rectified-Flow Perceiver
 # ---------------------------------------------------------------------------
 
 class RectifiedFlowPerceiver(nn.Module):
     """
-    Text-conditioned elastic perceiver that predicts the velocity field
+    Text + loudness conditioned perceiver that predicts the velocity field
     for rectified flow on EnCodec latent tokens.
 
     Forward signature::
 
-        v = model(z_t, t, context_audio, text_ids, text_segments)
+        v = model(z_t, t, transcription_ids, loudness)
 
     Parameters
     ----------
-    z_t            : (B, target_len, input_dim)  — noisy target audio
-    t              : (B,)                        — flow time in [0, 1]
-    context_audio  : (B, ctx_len, input_dim)     — clean context audio
-    text_ids       : (B, text_len)               — character indices
-    text_segments  : (B, text_len)               — 0=prior, 1=upcoming
+    z_t                : (B, n_target_frames, encodec_dim)  — noisy flow sample
+    t                  : (B,)                               — flow time in [0, 1]
+    transcription_ids  : (B, 128)                           — char IDs (fixed length)
+    loudness           : (B, 50)                            — per-100ms RMS values
 
     Returns
     -------
-    v : (B, target_len, input_dim) — predicted velocity (target only)
+    v : (B, n_target_frames, encodec_dim) — predicted velocity
     """
 
     def __init__(
         self,
-        input_dim: int,
-        dim: int = 256,
+        encodec_dim: int = 128,
+        n_target_frames: int = 375,
+        n_loudness: int = 50,
+        n_chars: int = 128,
+        dim: int = 512,
         num_heads: int = 8,
-        num_latent_layers: int = 12,
-        max_latents: int = 256,
+        num_context_layers: int = 3,
+        num_latent_layers: int = 8,
+        n_latents: int = 256,
         max_seq_len: int = 2048,
     ):
         super().__init__()
-        self.input_dim = input_dim
+        self.encodec_dim = encodec_dim
+        self.n_target_frames = n_target_frames
         self.dim = dim
-        self.max_latents = max_latents
 
         # ── Time conditioning ───────────────────────────────────────
         self.time_mlp = MLP(
             input_size=1, output_size=dim, hidden_dim=dim, num_hidden_blocks=1,
         )
 
-        # ── Text embeddings ─────────────────────────────────────────
+        # ── Transcription embeddings ────────────────────────────────
         self.char_emb = nn.Embedding(CHAR_VOCAB_SIZE, dim, padding_idx=CHAR_PAD_ID)
+        self.char_type_emb = nn.Parameter(torch.randn(dim) * 0.02)
 
-        # ── Segment embeddings (4-way) ──────────────────────────────
-        # 0=prior_text, 1=upcoming_text, 2=ctx_audio, 3=tgt_audio
-        self.segment_emb = nn.Embedding(4, dim)
+        # ── Loudness embeddings ─────────────────────────────────────
+        self.loudness_proj = nn.Linear(1, dim)
+        self.loudness_ln = nn.LayerNorm(dim)
+        self.loudness_mlp = MLP(
+            input_size=dim, output_size=dim, hidden_dim=dim, num_hidden_blocks=1,
+        )
+        self.loudness_type_emb = nn.Parameter(torch.randn(dim) * 0.02)
 
-        # ── Audio projection ────────────────────────────────────────
-        self.input_proj = nn.Linear(input_dim, dim)
+        # ── Noisy signal (z_t) embedding ────────────────────────────
+        self.signal_mlp = MLP(
+            input_size=encodec_dim, output_size=dim, hidden_dim=dim,
+            num_hidden_blocks=1,
+        )
+        self.signal_type_emb = nn.Parameter(torch.randn(dim) * 0.02)
+
+        # ── Context self-attention ──────────────────────────────────
+        self.context_layers = nn.ModuleList([
+            RoPESelfAttentionBlock(
+                dim=dim, num_heads=num_heads, max_seq_len=max_seq_len,
+            )
+            for _ in range(num_context_layers)
+        ])
 
         # ── Learnable latent bank ───────────────────────────────────
-        self.latents = nn.Parameter(torch.randn(max_latents, dim) * 0.02)
+        self.latents = nn.Parameter(torch.randn(n_latents, dim) * 0.02)
 
-        # ── Cross-attn DOWN: latents attend to full input ───────────
+        # ── Cross-attn DOWN: latents attend to context ──────────────
         self.cross_attn_down = RoPECrossAttention(
             dim=dim, num_heads=num_heads, max_seq_len=max_seq_len,
         )
@@ -276,75 +290,64 @@ class RectifiedFlowPerceiver(nn.Module):
             for _ in range(num_latent_layers)
         ])
 
-        # ── Cross-attn UP (target-only, ELIT-style residual) ───────
+        # ── Learned decoder array ───────────────────────────────────
+        self.decoder_tokens = nn.Parameter(
+            torch.randn(n_target_frames, dim) * 0.02
+        )
+
+        # ── Cross-attn UP: decoder attends to latents ──────────────
         self.cross_attn_up = RoPECrossAttention(
             dim=dim, num_heads=num_heads, max_seq_len=max_seq_len,
-        )
-        self.post_cross_norm = nn.LayerNorm(dim)
-        self.post_cross_mlp = MLP(
-            input_size=dim, output_size=dim, hidden_dim=dim,
-            num_hidden_blocks=1,
         )
 
         # ── Output projection → velocity ───────────────────────────
         self.output_mlp = MLP(
-            input_size=dim, output_size=input_dim, hidden_dim=dim,
+            input_size=dim, output_size=encodec_dim, hidden_dim=dim,
             num_hidden_blocks=1,
         )
 
     def forward(
         self,
-        z_t: torch.Tensor,            # (B, target_len, input_dim)
-        t: torch.Tensor,               # (B,)
-        context_audio: torch.Tensor,   # (B, ctx_len, input_dim)
-        text_ids: torch.Tensor,        # (B, text_len)
-        text_segments: torch.Tensor,   # (B, text_len)  — 0 or 1
-        n_latents: int | None = None,
+        z_t: torch.Tensor,                # (B, n_target_frames, encodec_dim)
+        t: torch.Tensor,                   # (B,)
+        transcription_ids: torch.Tensor,   # (B, 128)
+        loudness: torch.Tensor,            # (B, 50)
     ) -> torch.Tensor:
         B = z_t.shape[0]
 
-        # ① Time token
-        t_tok = self.time_mlp(t.view(B, 1, 1))  # (B, 1, dim)
+        # ① Time token: (B, 1, dim)
+        t_tok = self.time_mlp(t.view(B, 1, 1))
 
-        # ② Text tokens: char_emb + segment_emb
-        text_tok = (
-            self.char_emb(text_ids)
-            + self.segment_emb(text_segments)
-        )  # (B, text_len, dim)
+        # ② Transcription tokens: (B, 128, dim)
+        char_tok = self.char_emb(transcription_ids) + self.char_type_emb
 
-        # ③ Context audio tokens: proj + segment_emb[2]
-        ctx_tok = (
-            self.input_proj(context_audio)
-            + self.segment_emb.weight[SEG_CTX_AUDIO]
-        )  # (B, ctx_len, dim)
+        # ③ Loudness tokens: (B, 50, dim)
+        loud_tok = self.loudness_proj(loudness.unsqueeze(-1))  # (B, 50, dim)
+        loud_tok = self.loudness_ln(loud_tok)
+        loud_tok = self.loudness_mlp(loud_tok) + self.loudness_type_emb
 
-        # ④ Target audio tokens: proj + segment_emb[3]
-        tgt_tok = (
-            self.input_proj(z_t)
-            + self.segment_emb.weight[SEG_TGT_AUDIO]
-        )  # (B, target_len, dim)
+        # ④ Noisy signal tokens: (B, n_target_frames, dim)
+        signal_tok = self.signal_mlp(z_t) + self.signal_type_emb
 
-        # ⑤ Full input for cross-attn DOWN
-        full_input = torch.cat([t_tok, text_tok, ctx_tok, tgt_tok], dim=1)
+        # ⑤ Concatenate all context tokens
+        context = torch.cat([t_tok, char_tok, loud_tok, signal_tok], dim=1)
 
-        # Elastic latents
-        if n_latents is None:
-            n_latents = self.max_latents
-        n_latents = max(1, min(n_latents, self.max_latents))
-        latents = self.latents[:n_latents].unsqueeze(0).expand(B, -1, -1)
+        # ⑥ Context self-attention (3 layers)
+        for layer in self.context_layers:
+            context = layer(context)
 
-        # Cross-attn DOWN + residual
-        latents = self.cross_attn_down(latents, full_input) + latents
+        # ⑦ Cross-attn DOWN: latents attend to context
+        latents = self.latents.unsqueeze(0).expand(B, -1, -1)
+        latents = self.cross_attn_down(latents, context) + latents
 
-        # ⑥ Self-attention in latent space
+        # ⑧ Self-attention in latent space (8 layers)
         for layer in self.latent_layers:
             latents = layer(latents)
 
-        # ⑦ Cross-attn UP — ONLY target tokens as queries
-        cross_out = self.cross_attn_up(tgt_tok, latents)
-        z = self.post_cross_norm(cross_out) + tgt_tok   # residual to noisy target
-        fused = self.post_cross_mlp(z) + z               # second residual
+        # ⑨ Cross-attn UP: decoder tokens attend to latents
+        decoder = self.decoder_tokens.unsqueeze(0).expand(B, -1, -1)
+        decoded = self.cross_attn_up(decoder, latents)
 
-        # ⑧ Output projection → velocity (target only)
-        v = self.output_mlp(fused)  # (B, target_len, input_dim)
+        # ⑩ Output → velocity
+        v = self.output_mlp(decoded)  # (B, n_target_frames, encodec_dim)
         return v
