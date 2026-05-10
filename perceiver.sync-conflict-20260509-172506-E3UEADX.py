@@ -76,7 +76,6 @@ class DenseMLP(nn.Module):
 class MLP(nn.Module):
     """
     Linear(in→hidden) → [DenseMLP(2 layers) + skip] → Linear(hidden→out).
-    This is our flavor of MLP.
     """
 
     def __init__(
@@ -138,7 +137,6 @@ class RoPECrossAttention(nn.Module):
         K = self.w_k(kv_n).view(B, S_kv, self.num_heads, self.head_dim)
         V = self.w_v(kv_n).view(B, S_kv, self.num_heads, self.head_dim)
 
-        # ONLY APPLY ROPE TO Q, K, as in LLAMA!
         Q = self.rope(Q)
         K = self.rope(K)
 
@@ -146,7 +144,6 @@ class RoPECrossAttention(nn.Module):
         K = K.transpose(1, 2)
         V = V.transpose(1, 2)
 
-        # Torch optimized dot product attn
         out = F.scaled_dot_product_attention(Q, K, V)
         out = out.transpose(1, 2).contiguous().view(B, S_q, -1)
         return self.w_o(out)
@@ -295,7 +292,7 @@ class RectifiedFlowPerceiver(nn.Module):
 
         # ── Learned decoder array ───────────────────────────────────
         self.decoder_tokens = nn.Parameter(
-            torch.randn(n_target_frames, dim) * 0.02 # Don't init to 0, can cause issues with convergence
+            torch.randn(n_target_frames, dim) * 0.02
         )
 
         # ── Cross-attn UP: decoder attends to latents ──────────────
@@ -354,4 +351,3 @@ class RectifiedFlowPerceiver(nn.Module):
         # ⑩ Output → velocity
         v = self.output_mlp(decoded)  # (B, n_target_frames, encodec_dim)
         return v
-

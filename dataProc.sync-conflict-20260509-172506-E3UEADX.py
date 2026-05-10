@@ -125,8 +125,6 @@ def _compute_loudness(wav_mono: np.ndarray, sr: int) -> np.ndarray:
         return np.array([], dtype=np.float32)
     trimmed = wav_mono[: n_blocks * block_samples]
     blocks = trimmed.reshape(n_blocks, block_samples)
-
-    # RMS norm computation of loudness
     return np.sqrt(np.mean(blocks ** 2, axis=1)).astype(np.float32)
 
 
@@ -282,4 +280,3 @@ async def process_batch(batch_size: int = 16) -> list[dict]:
     print(f"[process_batch] {len(result)} items "
           f"(preproc={dt_preproc:.2f}s, encodec={dt_enc:.2f}s, total={dt_total:.2f}s)")
     return result
-
